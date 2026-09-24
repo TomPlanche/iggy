@@ -1,0 +1,13 @@
+[package]
+name = "sdk-lifecycle-repros"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Stand-alone: not a member of the surrounding Iggy workspace.
+[workspace]
+
+[dependencies]
+# apache/iggy master at the time of the report, without any local fix.
+iggy = { git = "https://github.com/apache/iggy", rev = "5d8129e95de1d1fdf2ed42af015340b82af1c59a" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
