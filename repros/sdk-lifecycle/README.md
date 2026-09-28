@@ -12,10 +12,11 @@ The programs connect to `127.0.0.1`. If the server runs in a container, publish 
 
 Then run each program from this directory:
 
-| Program | Expected | Actual on `5d8129e95` |
-| --- | --- | --- |
-| `cargo run --bin ws_connect_after_shutdown` | `connect()` after `shutdown()` returns `ClientShutdown` for TCP and WebSocket | TCP returns `ClientShutdown`, WebSocket returns `Ok(())` |
-| `cargo run --bin heartbeat_undoes_disconnect` | `get_me()` fails at both times | `get_me()` fails right after `disconnect()`, then succeeds 7 s later, because the heartbeat reconnects and signs in again |
-| `cargo run --bin ping_reconnects_after_disconnect` | Open question: must a direct `ping()` after an explicit `disconnect()` reconnect an auto-login client? | `get_me()` fails, `ping()` reconnects and signs in, then `get_me()` succeeds |
+| Program                                            | Expected                                                                                               | Actual on `5d8129e95`                                                                                                     |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `cargo run --bin ws_connect_after_shutdown`        | `connect()` after `shutdown()` returns `ClientShutdown` for TCP and WebSocket                          | TCP returns `ClientShutdown`, WebSocket returns `Ok(())`                                                                  |
+| `cargo run --bin heartbeat_undoes_disconnect`      | `get_me()` fails at both times                                                                         | `get_me()` fails right after `disconnect()`, then succeeds 7 s later, because the heartbeat reconnects and signs in again |
+| `cargo run --bin ping_reconnects_after_disconnect` | Open question: must a direct `ping()` after an explicit `disconnect()` reconnect an auto-login client? | `get_me()` fails, `ping()` reconnects and signs in, then `get_me()` succeeds                                              |
+| `cargo run --bin disconnect_after_shutdown`        | `connect()` after `shutdown()` and `disconnect()` returns `ClientShutdown` on every transport          | `connect()` returns `Ok(())` on TCP, WebSocket and QUIC, because `disconnect()` resets the state to `Disconnected`        |
 
 `ping_reconnects_after_disconnect` waits 500 ms before `disconnect()`. Without this wait, the first heartbeat tick runs at the same time as `disconnect()`, and the output changes from run to run.
