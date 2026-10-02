@@ -100,6 +100,11 @@ pub struct QuicClient {
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
     roster_learned: AtomicBool,
+    /// Set by an explicit `Client::disconnect` and cleared by `Client::connect`.
+    /// While it is set, no request reconnects the client on its own. A
+    /// connection that drops without a `disconnect()` call leaves it clear, so
+    /// that loss still heals.
+    disconnected_by_caller: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -119,10 +124,12 @@ impl Default for QuicClient {
 #[async_trait]
 impl Client for QuicClient {
     async fn connect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(false, Ordering::SeqCst);
         QuicClient::connect(self).await
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
+        self.disconnected_by_caller.store(true, Ordering::SeqCst);
         self.forget_session_credentials().await;
         QuicClient::disconnect_transport(self).await?;
         self.reset_vsr_session().await
@@ -173,6 +180,12 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        if self.caller_disconnected() {
+            return Err(match self.get_state().await {
+                ClientState::Shutdown => IggyError::ClientShutdown,
+                _ => IggyError::NotConnected,
+            });
+        }
         if is_poll_routing_code(code) {
             return self.send_poll_request(code, payload).await;
         }
@@ -638,6 +651,7 @@ impl QuicClient {
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
             roster_learned: AtomicBool::new(false),
+            disconnected_by_caller: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -684,7 +698,7 @@ impl QuicClient {
         crate::vsr::decode_response(Bytes::from(buffer))
     }
 
-    async fn connect(&self) -> Result<(), IggyError> {
+    pub(crate) async fn connect(&self) -> Result<(), IggyError> {
         self.connect_with_settlement(false).await
     }
 
@@ -712,6 +726,13 @@ impl QuicClient {
             .await
     }
 
+    /// A reconnect sweep checks this before each dial and before it installs
+    /// the connection: once the caller disconnects, nothing in the sweep may
+    /// bring the client back.
+    fn caller_disconnected(&self) -> bool {
+        self.disconnected_by_caller.load(Ordering::SeqCst)
+    }
+
     async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
         let settle_off_leader = context.settle_off_leader();
         let single_attempt = context.single_attempt();
@@ -731,6 +752,10 @@ impl QuicClient {
                 ClientState::Connecting => {
                     trace!("Client is already connecting.");
                     return Ok(());
+                }
+                _ if self.caller_disconnected() => {
+                    trace!("Cannot connect. The caller disconnected the client.");
+                    return Err(IggyError::NotConnected);
                 }
                 _ => {}
             }
@@ -755,6 +780,11 @@ impl QuicClient {
             let connection;
             let remote_address;
             loop {
+                if self.caller_disconnected() {
+                    self.set_state(ClientState::Disconnected).await;
+                    self.publish_event(DiagnosticEvent::Disconnected).await;
+                    return Err(IggyError::NotConnected);
+                }
                 let server_address_str = self.current_server_address.lock().await.clone();
                 let server_address = tokio::net::lookup_host(&server_address_str)
                     .await
@@ -832,6 +862,13 @@ impl QuicClient {
                 break;
             }
 
+            if self.caller_disconnected() {
+                connection.close(0u32.into(), b"");
+                self.set_state(ClientState::Disconnected).await;
+                self.publish_event(DiagnosticEvent::Disconnected).await;
+                return Err(IggyError::NotConnected);
+            }
+
             let now = IggyTimestamp::now();
             info!("{NAME} client has connected to server: {remote_address} at {now}",);
             self.set_state(ClientState::Connected).await;
@@ -893,6 +930,12 @@ impl QuicClient {
                         .map(|_| ()),
                 };
                 if let Err(error) = result {
+                    // An explicit disconnect landed during the sign-in. The
+                    // non-retryable arm below would keep the connection up.
+                    if self.caller_disconnected() {
+                        self.disconnect_transport().await?;
+                        return Err(IggyError::NotConnected);
+                    }
                     if crate::vsr::resume_error_is_retryable(&error) {
                         self.disconnect_transport().await?;
                     } else {
@@ -1953,5 +1996,22 @@ mod tests {
 
         let client = QuicClient::create(config);
         assert!(client.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_after_an_explicit_disconnect_is_refused() {
+        let client = QuicClient::default();
+        Client::disconnect(&client).await.unwrap();
+
+        // The recovery path of a request that was in flight during the
+        // disconnect calls the inherent `connect`, not the trait one.
+        let reconnect = tokio::time::timeout(Duration::from_secs(1), client.connect())
+            .await
+            .expect("a refused reconnect must not dial");
+
+        assert!(
+            matches!(reconnect, Err(IggyError::NotConnected)),
+            "got {reconnect:?}"
+        );
     }
 }
